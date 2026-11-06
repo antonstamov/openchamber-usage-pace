@@ -19,6 +19,9 @@ const QUOTA_PROVIDER = 'opencode-go';
 const CACHE_MS = 25 * 1000;
 
 const RU = {
+  label5h: '5 часов',
+  labelWeekly: 'Еженедельно',
+  labelMonthly: 'Ежемесячно',
   cap: (n) => `лимит ${n}`,
   under: (pp, tail) => `Недорасход ${pp} — можно добрать до нормы.${tail ? ` ${tail}` : ''}`,
   slightlyOver: (pp, tail) => `Чуть выше нормы на ${pp} — лучше выровнять темп.${tail ? ` ${tail}` : ''}`,
@@ -70,6 +73,9 @@ const RU = {
 };
 
 const EN = {
+  label5h: '5-Hour',
+  labelWeekly: 'Weekly',
+  labelMonthly: 'Monthly',
   cap: (n) => `cap ${n}`,
   under: (pp, tail) => `Under the pace by ${pp} — room to spend more.${tail ? ` ${tail}` : ''}`,
   slightlyOver: (pp, tail) => `A little above the pace by ${pp} — ease off a touch.${tail ? ` ${tail}` : ''}`,
@@ -275,7 +281,7 @@ function monthlyRow(pace, strings, locale) {
   return {
     kind: 'line',
     id: 'monthly',
-    label: 'Monthly',
+    label: strings.labelMonthly,
     dot: tone === 'muted' ? undefined : tone,
     content: { kind: 'bar', value: bar.value, tone },
     value: `${used} / ${norm}`,
@@ -317,7 +323,7 @@ function segmentRow(key, pace, signal, strings) {
   return {
     kind: 'line',
     id: key === '5h' ? 'five-hour' : 'weekly',
-    label: key === '5h' ? '5-Hour' : 'Weekly',
+    label: key === '5h' ? strings.label5h : strings.labelWeekly,
     dot,
     content: {
       kind: 'bar',

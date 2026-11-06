@@ -345,6 +345,7 @@ test('all three windows are shown with their normal, even when quiet', () => {
   assert.ok(fiveHour);
   assert.equal(fiveHour.badge, undefined);
   assert.equal(fiveHour.dot, 'success');
+  assert.equal(fiveHour.label, '5-Hour');
   assert.equal(shown(fiveHour.value), '1.0% / 1.4%');
   assert.equal(fiveHour.valueTone, undefined);
   assert.equal(fiveHour.content.tone, 'success');
@@ -353,6 +354,7 @@ test('all three windows are shown with their normal, even when quiet', () => {
 
   const weekly = view.rows.find((row) => row.id === 'weekly');
   assert.ok(weekly);
+  assert.equal(weekly.label, 'Weekly');
   assert.equal(weekly.badge, undefined);
   assert.equal(weekly.dot, 'success');
   assert.equal(shown(weekly.value), '2.4% / 19%');
@@ -361,6 +363,7 @@ test('all three windows are shown with their normal, even when quiet', () => {
 
   const monthly = view.rows.find((row) => row.id === 'monthly');
   assert.ok(monthly);
+  assert.equal(monthly.label, 'Monthly');
   assert.equal(monthly.badge, undefined);
   assert.equal(shown(monthly.value), '20% / 6.1%');
   assert.equal(monthly.valueTone, 'error');
@@ -381,15 +384,18 @@ test('russian copy follows the host locale', () => {
   const fiveHour = view.rows.find((row) => row.id === 'five-hour');
   assert.ok(fiveHour);
   assert.equal(fiveHour.dot, 'success');
+  assert.equal(fiveHour.label, '5 часов');
   assert.equal(shown(fiveHour.value), '1.0% / 1.4%');
   assert.equal(fiveHour.tooltip, 'Норма к концу окна 2.9% · уже в норме.');
 
   const weekly = view.rows.find((row) => row.id === 'weekly');
   assert.ok(weekly);
+  assert.equal(weekly.label, 'Еженедельно');
   assert.equal(weekly.tooltip, 'Норма к концу недели 38% · уже в норме.');
 
   const monthly = view.rows.find((row) => row.id === 'monthly');
   assert.ok(monthly);
+  assert.equal(monthly.label, 'Ежемесячно');
   assert.equal(shown(monthly.value), '20% / 6.1%');
   assert.match(monthly.tooltip, /20% \/ норма 6.1% — перерасход 14 п\.п\./);
   assert.doesNotMatch(monthly.tooltip, /by reset|К сбросу/);
