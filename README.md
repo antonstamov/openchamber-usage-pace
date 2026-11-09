@@ -116,33 +116,33 @@ In the WSL UI open `Settings → Extensions`, paste that path, allow the local s
 ```text
 status section (rendered by OpenChamber)
         ↑ GET /status
-local service (service/main.js)
-        ↑ GET /api/quota/opencode-go
-OpenChamber on 127.0.0.1
+local service (service/main.js + service/console-go.js)
+        ↑ usage.read (POST /quota, host → service, with OpenCode credentials)
+        ↑ https://opencode.ai/console + https://opencode.ai/zen (service → Console API)
 ```
 
-- The service reads `~/.config/openchamber/settings.json`: `desktopLocalPort` and `desktopLocalClientToken`.
-- It calls `GET http://127.0.0.1:<port>/api/quota/opencode-go`.
-- It caches the successful response for 25 seconds. The section polls every 30 seconds.
-- No API keys are copied, nothing leaves the machine. The service only reads settings and talks to localhost.
+- On every card refresh the host posts `usage.read` to the service at `POST /quota`, handing it the OpenCode entries it holds for `opencode-go` and `opencode` — and nothing else. The install/upgrade approval dialog names both.
+- The service reads the quota straight from the OpenCode Console API with the handed credential, mirroring the host's built-in `opencode-go` provider (`service/console-go.js`): Console sign-in first, `opencode-go` API key as fallback, key on `opencode` as fallback for that, billing balance as a best-effort credits row. Error classes match the built-in (`sign in again`, `no subscription`, `key expired`), so the extension card and the pace rows agree with the native card.
+- The same result feeds `/status` (the pace rows): the service caches the successful read for 25 seconds and reuses the last handed credential between card refreshes. The host never receives credentials back and is never contacted over HTTP: no settings file, no ports, no passwords, no `/proc`.
+- Until the host shares a credential (e.g. the Usage page was never opened), `/status` answers a waiting note instead of numbers.
 - Copy language follows the host UI locale: the host requests `/status?locale=ru` for Russian, anything else (or missing) renders English.
 
-### WSL and web server
+### Extension usage card (quota role)
 
-In web mode (`openchamber serve`) `settings.json` has no `desktopLocalClientToken`. Then the service:
+The manifest declares `service.provides: ["quota"]` with `contributes.quota.providers: ["opencode-go", "opencode"]`, so the host draws a standard usage card for the extension next to the built-in OpenCode Go card. Both provider ids are listed because a Console sign-in and the fallback API key live on different OpenCode integrations, and the host only hands over entries for listed ids.
 
-1. Finds the OpenChamber process on Linux and reads `OPENCHAMBER_UI_PASSWORD` from its environment (`/proc`, same user).
-2. Logs in at `/auth/session` and gets a client token.
-3. Caches the token for an hour; retries login on 401.
+The card is a host-rendered twin of the built-in one by design: it proves the direct Console read agrees with the native numbers. The pace math lives only in the status section below it.
 
-The password is never stored on disk. If the server runs as another user and `/proc` is unavailable, a `desktopLocalClientToken` is needed, or run as the same user.
+### No host discovery
+
+The service knows nothing about the host: no `settings.json`, no port probing, no UI password, no `/proc`. A passwordless dev server on a custom port, a desktop app, and a locked web server all work the same way, because the credential arrives with `usage.read`. The pace rows stay empty until the host shares a credential (open the Usage page once).
 
 ## Limits
 
-- The extension uses OpenChamber's internal `/api/quota/opencode-go` route. If an OpenChamber update changes it, the section shows "no data". That is the price of not patching core.
+- `service/console-go.js` mirrors the host's built-in `opencode-go` provider (Console status, API-key fallback, billing balance, error classes). If OpenChamber changes that provider's contract, the mirror drifts: the twin card will disagree with the native one, which is the signal to re-sync. That is the price of not patching core.
+- Console budgets (per-member spend limits) are not read: they need the running OpenCode, which a service cannot reach. The host shows them on the Usage page only; neither the twin card nor the pace rows include them.
 - The month is a calendar cycle back from the reset date. If OpenCode Go moves to rolling 30 days, adjust `subtractMonth()` in `service/pace.js`.
-- The service does not inherit user environment variables, so the default `~/.config/openchamber/settings.json` path is required. For a non-standard path use `OPENCHAMBER_DATA_DIR` (read in `service/main.js`).
-- The extension supports OpenChamber `>= 2.5.0`.
+- The extension supports OpenChamber `>= 2.7.0` (the quota role floor).
 
 ## Threshold tuning
 
@@ -168,15 +168,17 @@ const nearCap = used >= 80;
 ## Development
 
 ```powershell
-node test/pace.test.js
+npm test
 ```
 
-Tests cover monthly-cycle math, month boundaries, projection, signal thresholds and row assembly.
+Tests cover monthly-cycle math, month boundaries, projection, signal thresholds, row assembly, the Console API mirror (credential selection, fallbacks, error classes) and the `usage.read` mapping.
 
-Check a live response without installing:
+Check a live response without installing (hand a credential the way the host would):
 
 ```powershell
-node -e "require('./service/main').getQuota().then(r => console.log(JSON.stringify(require('./service/main').buildView({quota:r.quota, stale:r.stale, error:r.error}), null, 2)))"
+$cred = '{"opencode-go":{"type":"api","key":"oc_sk_..."}}'
+$body = [System.Text.Encoding]::UTF8.GetBytes($(@{v=1; method='usage.read'; input=@{credentials=($cred | ConvertFrom-Json)}} | ConvertTo-Json -Depth 6 -Compress))
+# then POST $body to /quota, then GET /status — the pace rows reuse the handed credential
 ```
 
 Run the service manually:
@@ -196,7 +198,9 @@ Invoke-RestMethod -Uri 'http://127.0.0.1:45999/status' -Headers @{Authorization=
 ```text
 package.json          extension manifest
 service/pace.js       window math, normals and signals
+service/console-go.js direct OpenCode Console quota read (mirrors the built-in provider)
 service/main.js       local HTTP service and status section assembly
-test/pace.test.js     tests
+test/pace.test.js     pace math tests
+test/quota.test.js    Console mirror and usage.read mapping tests
 README.md             this file
 ```

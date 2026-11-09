@@ -1,9 +1,6 @@
 'use strict';
 
-const fs = require('node:fs');
 const http = require('node:http');
-const os = require('node:os');
-const path = require('node:path');
 
 const {
   computePace,
@@ -12,8 +9,7 @@ const {
   monthlyCooldown,
   paceBar,
 } = require('./pace');
-
-const QUOTA_PROVIDER = 'opencode-go';
+const { fetchGoQuota } = require('./console-go');
 // A short cache only absorbs duplicate reads between the host's 30s polls; it
 // must stay under the poll interval so a window reset shows up right away.
 const CACHE_MS = 25 * 1000;
@@ -66,6 +62,7 @@ const RU = {
   stale: (error) => `OpenChamber не обновил данные: ${error}. Показаны последние известные.`,
   error: (error) => `Не удалось получить данные OpenCode Go: ${error}.`,
   notConfigured: 'OpenCode Go не подключён в OpenChamber.',
+  waiting: 'Откройте страницу Usage, чтобы OpenChamber передал кред OpenCode Go.',
   noMonthly: 'OpenCode Go не вернул месячное окно.',
   noData: 'OpenCode Go не вернул окна использования.',
   days: (n) => `${n} ${pluralRu(n, ['день', 'дня', 'дней'])}`,
@@ -120,6 +117,7 @@ const EN = {
   stale: (error) => `OpenChamber did not refresh: ${error}. Showing the last known values.`,
   error: (error) => `Could not read OpenCode Go usage: ${error}.`,
   notConfigured: 'OpenCode Go is not connected in OpenChamber.',
+  waiting: 'Open the Usage page once so OpenChamber shares the OpenCode Go credential.',
   noMonthly: 'OpenCode Go reported no monthly meter.',
   noData: 'OpenCode Go reported no usage windows.',
   days: (n) => `${n} day${n === 1 ? '' : 's'}`,
@@ -427,221 +425,167 @@ function buildView({ quota = null, locale = 'en', stale = false, error = null, n
 }
 
 /* --------------------------------------------------------------------------
- * OpenChamber quota bridge
+ * Direct quota source
+ *
+ * The numbers come from the OpenCode Console API, read with the credential
+ * the host hands the service on every `usage.read`. Nothing is discovered
+ * about the host itself: no settings file, no ports, no passwords.
  * ------------------------------------------------------------------------ */
 
-function settingsPath() {
-  const dataDir = process.env.OPENCHAMBER_DATA_DIR
-    ? path.resolve(process.env.OPENCHAMBER_DATA_DIR)
-    : path.join(os.homedir(), '.config', 'openchamber');
-  return path.join(dataDir, 'settings.json');
-}
-
-function readSettings() {
-  const file = settingsPath();
-  let raw;
-  try {
-    raw = fs.readFileSync(file, 'utf8');
-  } catch (error) {
-    const hint = error && error.code === 'ENOENT'
-      ? `Settings file not found: ${file}`
-      : `Could not read ${file}: ${error instanceof Error ? error.message : String(error)}`;
-    throw new Error(hint);
-  }
-  try {
-    return JSON.parse(raw);
-  } catch {
-    throw new Error(`Settings file is not valid JSON: ${file}`);
-  }
-}
-
-function resolveRoute() {
-  const settings = readSettings();
-  return {
-    token: String(settings.desktopLocalClientToken || '').trim(),
-    ports: [
-      Number(settings.desktopLocalPort),
-      Number(process.env.OPENCHAMBER_PORT),
-      3000,
-      3001,
-      8080,
-    ].filter((port, index, list) => Number.isInteger(port) && port > 0 && list.indexOf(port) === index),
-  };
-}
-
-let cachedUiPassword;
-let authCache = { baseUrl: null, token: null, at: 0 };
+let lastCredentials = null;
+let quotaCache = { at: 0, result: null };
 
 /**
- * A web/WSL server has no `desktopLocalClientToken` in settings.json. It runs
- * with OPENCHAMBER_UI_PASSWORD in its own environment; the guest service runs
- * as the same user and can read that environment from /proc, then sign in for
- * a short-lived client token.
+ * The latest credential map the host handed over (`input.credentials` of
+ * `usage.read`), kept for the host-driven `/status` polls between card
+ * refreshes. Credentials are read fresh on every `usage.read`, like the
+ * built-in provider does, so an account switch never shows stale numbers.
  */
-function readProcessUiPassword() {
-  if (process.platform !== 'linux') return null;
-
-  let pids;
-  try {
-    pids = fs.readdirSync('/proc').filter((entry) => /^\d+$/.test(entry));
-  } catch {
-    return null;
+function storeCredentials(input) {
+  if (input && typeof input === 'object'
+    && input.credentials && typeof input.credentials === 'object'
+    && Object.keys(input.credentials).length > 0) {
+    lastCredentials = input.credentials;
   }
-
-  const readEnv = (pid) => {
-    try {
-      const env = fs.readFileSync(`/proc/${pid}/environ`, 'utf8');
-      const line = env.split('\0').find((entry) => entry.startsWith('OPENCHAMBER_UI_PASSWORD='));
-      return line ? line.slice('OPENCHAMBER_UI_PASSWORD='.length) : null;
-    } catch {
-      return null;
-    }
-  };
-
-  // Prefer the server process itself, so another shell's stale value wins
-  // neither at startup nor after a restart.
-  for (const pid of pids) {
-    try {
-      const cmdline = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8');
-      if (!/@openchamber\/web|openchamber.*serve/i.test(cmdline)) continue;
-      const password = readEnv(pid);
-      if (password) return password;
-    } catch {
-      // The process ended while being inspected.
-    }
-  }
-
-  for (const pid of pids) {
-    const password = readEnv(pid);
-    if (password) return password;
-  }
-  return null;
 }
-
-function readUiPassword() {
-  if (cachedUiPassword !== undefined) return cachedUiPassword;
-  const fromEnv = String(process.env.OPENCHAMBER_UI_PASSWORD || '').trim();
-  cachedUiPassword = fromEnv || readProcessUiPassword() || null;
-  return cachedUiPassword;
-}
-
-async function loginClientToken(baseUrl, password) {
-  const response = await fetch(`${baseUrl}/auth/session`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-    body: JSON.stringify({
-      password,
-      trustDevice: true,
-      issueClientToken: true,
-      clientLabel: 'usage-pace',
-    }),
-    signal: AbortSignal.timeout(6000),
-  });
-
-  if (!response.ok) {
-    throw new Error(`OpenChamber UI login failed (HTTP ${response.status})`);
-  }
-
-  const body = await response.json().catch(() => null);
-  if (!body || typeof body.clientToken !== 'string' || !body.clientToken) {
-    throw new Error('OpenChamber UI login did not return a client token');
-  }
-  return body.clientToken;
-}
-
-async function authTokenFor(baseUrl, settingsToken, forceLogin = false) {
-  if (!forceLogin && settingsToken) return settingsToken;
-
-  if (!forceLogin
-    && authCache.baseUrl === baseUrl
-    && authCache.token
-    && Date.now() - authCache.at < 60 * 60 * 1000) {
-    return authCache.token;
-  }
-
-  const password = readUiPassword();
-  if (!password) {
-    throw new Error('No OpenChamber UI token or OPENCHAMBER_UI_PASSWORD was found for the local server');
-  }
-
-  const token = await loginClientToken(baseUrl, password);
-  authCache = { baseUrl, token, at: Date.now() };
-  return token;
-}
-
-function requestQuota(baseUrl, token) {
-  return fetch(`${baseUrl}/api/quota/${QUOTA_PROVIDER}`, {
-    headers: {
-      Authorization: `Bearer ${token}`,
-      Accept: 'application/json',
-      'User-Agent': 'openchamber-usage-pace/1.0',
-    },
-    signal: AbortSignal.timeout(6000),
-  });
-}
-
-async function fetchQuota() {
-  const { token: settingsToken, ports } = resolveRoute();
-  let lastError = null;
-
-  for (const port of ports) {
-    const baseUrl = `http://127.0.0.1:${port}`;
-    try {
-      let token = await authTokenFor(baseUrl, settingsToken);
-      let response = await requestQuota(baseUrl, token);
-
-      // A desktop token can expire, and a web/WSL login token can be revoked.
-      // Read the password again and retry once with a fresh client token.
-      if (response.status === 401) {
-        authCache = { baseUrl: null, token: null, at: 0 };
-        cachedUiPassword = undefined;
-        token = await authTokenFor(baseUrl, '', true);
-        response = await requestQuota(baseUrl, token);
-      }
-
-      if (response.status === 401) {
-        throw new Error('OpenChamber rejected the local request (401). Check the UI password or client token.');
-      }
-      if (!response.ok) {
-        throw new Error(`OpenChamber quota API returned HTTP ${response.status}`);
-      }
-
-      const body = await response.json().catch(() => null);
-      if (!body || typeof body !== 'object') {
-        throw new Error('OpenChamber returned an unreadable quota response');
-      }
-      return body;
-    } catch (error) {
-      lastError = error;
-      const refused = error && (error.name === 'TypeError' || error.cause?.code === 'ECONNREFUSED');
-      if (refused) continue;
-      throw error;
-    }
-  }
-
-  throw lastError || new Error('OpenChamber is not reachable on localhost');
-}
-
-let cache = { at: 0, quota: null };
 
 async function getQuota(force = false) {
-  if (!force && cache.quota && Date.now() - cache.at < CACHE_MS) {
-    return { quota: cache.quota, stale: false, error: null };
+  if (!force && quotaCache.result && Date.now() - quotaCache.at < CACHE_MS) {
+    return { quota: quotaCache.result, stale: false, error: null, waiting: false };
+  }
+
+  if (!lastCredentials) {
+    if (quotaCache.result) {
+      return { quota: quotaCache.result, stale: true, error: 'CREDENTIAL_NOT_SHARED', waiting: true };
+    }
+    return { quota: null, stale: false, error: 'CREDENTIAL_NOT_SHARED', waiting: true };
   }
 
   try {
-    const quota = await fetchQuota();
-    if (quota.ok !== false) {
-      cache = { at: Date.now(), quota };
+    const result = await fetchGoQuota(lastCredentials);
+    if (result.ok) {
+      quotaCache = { at: Date.now(), result };
+      return { quota: result, stale: false, error: null, waiting: false };
     }
-    return { quota, stale: false, error: null };
+    if (quotaCache.result) {
+      return { quota: quotaCache.result, stale: true, error: result.error, waiting: false };
+    }
+    return { quota: result, stale: false, error: result.error, waiting: false };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    if (cache.quota) {
-      return { quota: cache.quota, stale: true, error: message };
+    if (quotaCache.result) {
+      return { quota: quotaCache.result, stale: true, error: message, waiting: false };
     }
-    return { quota: null, stale: false, error: message };
+    return { quota: null, stale: false, error: message, waiting: false };
   }
+}
+
+/* --------------------------------------------------------------------------
+ * Extension quota provider role (`provides: ["quota"]`)
+ *
+ * The host draws a standard card for the extension and asks it for usage
+ * with POST /quota (`usage.read`), handing it the OpenCode credential it
+ * holds for `opencode-go`. The numbers themselves still come from the
+ * host's own quota endpoint (the same bridge as /status): this keeps one
+ * fetch implementation while the card stays a host-rendered built-in twin.
+ * ------------------------------------------------------------------------ */
+
+const QUOTA_WINDOWS_MAX = 32;
+const QUOTA_NAME_MAX = 128;
+const QUOTA_LABEL_MAX = 128;
+const QUOTA_RESERVED_NAMES = new Set(['__proto__', 'constructor', 'prototype']);
+
+function isSafeWindowName(name) {
+  return typeof name === 'string'
+    && name.length >= 1
+    && name.length <= QUOTA_NAME_MAX
+    && !QUOTA_RESERVED_NAMES.has(name);
+}
+
+/**
+ * Pick only the keys the host's `quotaProviderSchemasV1` accepts (it is
+ * strict: derived fields like `remainingPercent` would fail the parse).
+ */
+function mapQuotaWindow(window) {
+  if (!window || typeof window !== 'object') return null;
+  const mapped = {
+    usedPercent: typeof window.usedPercent === 'number'
+      && Number.isFinite(window.usedPercent)
+      && window.usedPercent >= 0
+      ? window.usedPercent
+      : null,
+    windowSeconds: Number.isInteger(window.windowSeconds) && window.windowSeconds > 0
+      ? window.windowSeconds
+      : null,
+    resetAt: Number.isInteger(window.resetAt) && window.resetAt >= 0 && window.resetAt <= Number.MAX_SAFE_INTEGER
+      ? window.resetAt
+      : (typeof window.resetAt === 'number' && Number.isFinite(window.resetAt) && window.resetAt >= 0
+        ? Math.floor(window.resetAt)
+        : null),
+  };
+  if (typeof window.valueLabel === 'string' && window.valueLabel.trim() !== '') {
+    mapped.valueLabel = window.valueLabel.slice(0, QUOTA_LABEL_MAX);
+  }
+  if (typeof window.creditsUsed === 'number' && Number.isFinite(window.creditsUsed) && window.creditsUsed >= 0) {
+    mapped.creditsUsed = window.creditsUsed;
+  }
+  return mapped;
+}
+
+function mapQuotaToUsageData(quota) {
+  if (!quota || typeof quota !== 'object') {
+    return { ok: false, configured: true, error: 'OpenChamber returned an unreadable quota response', usage: null };
+  }
+  if (quota.configured === false) {
+    return {
+      ok: false,
+      configured: false,
+      error: String(quota.error || 'OpenCode Go is not connected in OpenChamber'),
+      usage: null,
+    };
+  }
+  const source = quota.usage && typeof quota.usage === 'object' ? quota.usage.windows : null;
+  const windows = {};
+  if (source && typeof source === 'object') {
+    for (const name of Object.keys(source).slice(0, QUOTA_WINDOWS_MAX)) {
+      if (!isSafeWindowName(name)) continue;
+      const mapped = mapQuotaWindow(source[name]);
+      if (mapped) windows[name] = mapped;
+    }
+  }
+  if (Object.keys(windows).length === 0) {
+    return {
+      ok: false,
+      configured: typeof quota.configured === 'boolean' ? quota.configured : true,
+      error: String((quota.ok === false && quota.error) || 'OpenCode Go returned no usage windows'),
+      usage: null,
+    };
+  }
+  const data = {
+    ok: quota.ok !== false,
+    configured: true,
+    usage: { windows },
+  };
+  if (quota.ok === false && quota.error) data.error = String(quota.error);
+  return data;
+}
+
+function parseUsageRead(body) {
+  let parsed = body;
+  if (typeof parsed === 'string') {
+    try {
+      parsed = JSON.parse(parsed);
+    } catch {
+      return { error: 'Request body is not valid JSON' };
+    }
+  }
+  if (!parsed || typeof parsed !== 'object') {
+    return { error: 'Request body must be a JSON object' };
+  }
+  if (parsed.method !== 'usage.read') {
+    return { error: `Unsupported method: ${String(parsed.method || '(missing)')}` };
+  }
+  return { input: parsed.input && typeof parsed.input === 'object' ? parsed.input : {} };
 }
 
 /* --------------------------------------------------------------------------
@@ -680,14 +624,48 @@ function startServer() {
 
     if (req.method === 'GET' && url.pathname === '/status') {
       const locale = url.searchParams.get('locale') || 'en';
-      const { quota, stale, error } = await getQuota(false);
-      sendJson(res, 200, buildView({ quota, locale, stale, error }));
+      const { quota, stale, error, waiting } = await getQuota(false);
+      const strings = stringsFor(locale);
+      sendJson(res, 200, buildView({ quota, locale, stale, error: waiting ? strings.waiting : error }));
       return;
     }
 
     if (req.method === 'POST' && url.pathname === '/status') {
       // No controls in this version. Keep the route for a future refresh button.
       sendJson(res, 200, { ok: true });
+      return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/quota') {
+      // Extension quota provider role: the host posts `usage.read` with the
+      // OpenCode credentials it holds. The numbers come straight from the
+      // OpenCode Console API; the host itself is never contacted.
+      let raw = '';
+      req.on('data', (chunk) => {
+        raw += chunk;
+        if (raw.length > 65536) req.destroy();
+      });
+      req.on('end', async () => {
+        const parsed = parseUsageRead(raw);
+        if (parsed.error) {
+          sendJson(res, 400, { ok: false, error: { message: parsed.error } });
+          return;
+        }
+        storeCredentials(parsed.input);
+        try {
+          const { quota, waiting } = await getQuota(true);
+          const data = mapQuotaToUsageData(quota);
+          if (waiting) {
+            data.error = 'OpenChamber has not shared the OpenCode Go credential yet.';
+          }
+          sendJson(res, 200, { ok: true, data });
+        } catch (error) {
+          sendJson(res, 200, {
+            ok: false,
+            error: { message: error instanceof Error ? error.message : String(error) },
+          });
+        }
+      });
       return;
     }
 
@@ -711,9 +689,10 @@ if (require.main === module) {
 module.exports = {
   buildView,
   valueUnits,
-  fetchQuota,
+  stringsFor,
   getQuota,
-  readSettings,
-  resolveRoute,
-  settingsPath,
+  storeCredentials,
+  mapQuotaWindow,
+  mapQuotaToUsageData,
+  parseUsageRead,
 };

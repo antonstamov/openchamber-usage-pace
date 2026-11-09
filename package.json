@@ -1,20 +1,20 @@
 {
   "name": "openchamber-usage-pace",
-  "version": "1.10.0",
+  "version": "1.12.1",
   "private": true,
   "description": "Monthly usage pace and segment burst signals for OpenCode Go in OpenChamber",
   "scripts": {
-    "test": "node test/pace.test.js"
+    "test": "node --test \"test/*.test.js\""
   },
   "openchamber": {
     "apiVersion": 1,
     "engines": {
-      "openchamber": ">=2.5.0"
+      "openchamber": ">=2.7.0"
     },
     "contributes": {
       "panel": {
         "id": "usage-pace",
-        "name": "OpenCode Go usage pace",
+        "name": "OpenCode Go usage",
         "icon": "bar-chart-2"
       },
       "statusSection": {
@@ -27,7 +27,16 @@
       },
       "service": {
         "entry": "service/main.js",
-        "runtime": "host"
+        "runtime": "host",
+        "provides": [
+          "quota"
+        ]
+      },
+      "quota": {
+        "providers": [
+          "opencode-go",
+          "opencode"
+        ]
       }
     }
   }
