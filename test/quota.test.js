@@ -5,6 +5,8 @@ const assert = require('node:assert/strict');
 const {
   mapQuotaToUsageData,
   parseUsageRead,
+  waitForCredentials,
+  storeCredentials,
 } = require('../service/main');
 const {
   fetchGoQuota,
@@ -224,6 +226,17 @@ test('usage.read body validates', () => {
   assert.deepEqual(good.input, { credentials: {} });
   assert.ok(parseUsageRead(JSON.stringify({ method: 'sessions.list' })).error);
   assert.ok(parseUsageRead('not json').error);
+});
+
+test('status waits briefly for credentials on their way', async () => {
+  // One sequenced test: the module-level credential store is shared, so the
+  // phases must not run concurrently with each other.
+  assert.equal(await waitForCredentials(30), false);
+  setTimeout(() => storeCredentials({ credentials: { opencode: { type: 'api', key: 'x' } } }), 20);
+  assert.equal(await waitForCredentials(500), true);
+  const start = Date.now();
+  assert.equal(await waitForCredentials(500), true);
+  assert.ok(Date.now() - start < 100);
 });
 
 (async () => {

@@ -1,6 +1,9 @@
 'use strict';
 
+const fs = require('node:fs');
 const http = require('node:http');
+const os = require('node:os');
+const path = require('node:path');
 
 const {
   computePace,
@@ -13,6 +16,13 @@ const { fetchGoQuota } = require('./console-go');
 // A short cache only absorbs duplicate reads between the host's 30s polls; it
 // must stay under the poll interval so a window reset shows up right away.
 const CACHE_MS = 25 * 1000;
+// Startup race pad: on (re)start the host's first GET /status routinely lands
+// milliseconds before the POST /quota that shares the credentials (seen live:
+// 1 ms apart). Hold a credential-less read briefly so it picks up credentials
+// that are already on their way instead of flashing "waiting". Well under the
+// host's 20 s service budget.
+const CREDENTIAL_WAIT_MS = 1000;
+const CREDENTIAL_WAIT_STEP_MS = 50;
 
 const RU = {
   label5h: '5 часов',
@@ -59,8 +69,8 @@ const RU = {
   nearCap: (label, used) => `${label} ${used} — близко к лимиту окна`,
   overCap: (label, used) => `${label} ${used} — лимит окна исчерпан`,
   slowDown: 'Притормози, чтобы не выесть месяц.',
-  stale: (error) => `OpenChamber не обновил данные: ${error}. Показаны последние известные.`,
-  error: (error) => `Не удалось получить данные OpenCode Go: ${error}.`,
+  stale: (error) => `OpenChamber не обновил данные: ${cleanTail(error)}. Показаны последние известные.`,
+  error: (error) => `Не удалось получить данные OpenCode Go: ${cleanTail(error)}.`,
   notConfigured: 'OpenCode Go не подключён в OpenChamber.',
   waiting: 'Откройте страницу Usage, чтобы OpenChamber передал кред OpenCode Go.',
   noMonthly: 'OpenCode Go не вернул месячное окно.',
@@ -114,8 +124,8 @@ const EN = {
   nearCap: (label, used) => `${label} ${used} — close to the window cap`,
   overCap: (label, used) => `${label} ${used} — window cap reached`,
   slowDown: 'Slow down so the month lasts.',
-  stale: (error) => `OpenChamber did not refresh: ${error}. Showing the last known values.`,
-  error: (error) => `Could not read OpenCode Go usage: ${error}.`,
+  stale: (error) => `OpenChamber did not refresh: ${cleanTail(error)}. Showing the last known values.`,
+  error: (error) => `Could not read OpenCode Go usage: ${cleanTail(error)}.`,
   notConfigured: 'OpenCode Go is not connected in OpenChamber.',
   waiting: 'Open the Usage page once so OpenChamber shares the OpenCode Go credential.',
   noMonthly: 'OpenCode Go reported no monthly meter.',
@@ -135,6 +145,11 @@ function pluralRu(value, forms) {
 
 function stringsFor(locale) {
   return String(locale || 'en').toLowerCase().startsWith('ru') ? RU : EN;
+}
+
+/** The interpolated detail may already end with a period (the waiting copy does). */
+function cleanTail(text) {
+  return String(text || '').replace(/[\s.…]+$/u, '');
 }
 
 function clip(text, max) {
@@ -334,11 +349,17 @@ function segmentRow(key, pace, signal, strings) {
   };
 }
 
-function buildView({ quota = null, locale = 'en', stale = false, error = null, now = Date.now() } = {}) {
+function buildView({ quota = null, locale = 'en', stale = false, error = null, waiting = false, now = Date.now() } = {}) {
   const strings = stringsFor(locale);
   const rows = [];
 
   if (!quota && error) {
+    // Waiting for the first shared credential is a normal cold start (the
+    // service keeps credentials in memory only), not a failure: keep it muted.
+    if (waiting) {
+      rows.push(note('waiting', strings.waiting, 'muted'));
+      return { rows };
+    }
     rows.push(note('error', strings.error(error), 'error'));
     return { rows };
   }
@@ -413,7 +434,11 @@ function buildView({ quota = null, locale = 'en', stale = false, error = null, n
   }
 
   if (stale) {
-    rows.push(note('stale', strings.stale(error || 'unknown error'), 'warning'));
+    if (waiting) {
+      rows.push(note('stale-waiting', strings.waiting, 'muted'));
+    } else {
+      rows.push(note('stale', strings.stale(error || 'unknown error'), 'warning'));
+    }
   }
 
   if (rows.length === 0) {
@@ -435,6 +460,59 @@ function buildView({ quota = null, locale = 'en', stale = false, error = null, n
 let lastCredentials = null;
 let quotaCache = { at: 0, result: null };
 
+/* --------------------------------------------------------------------------
+ * Diagnostics (D): the service keeps credentials and the quota in memory
+ * only, so any restart wipes both and /status answers "waiting" until the
+ * next POST /quota. These counters (visible on GET /health, no secrets)
+ * tell a restart-driven waiting flash apart from a host that stopped
+ * sharing credentials with a live service.
+ * ------------------------------------------------------------------------ */
+
+const stats = {
+  startedAt: Date.now(),
+  statusGets: 0,
+  quotaPosts: 0,
+  quotaWithCreds: 0,
+  statusWaiting: 0,
+  fetchOk: 0,
+  fetchFail: 0,
+  lastQuotaAt: 0,
+  lastFetchAt: 0,
+  lastFetchOkAt: 0,
+  lastFetchError: null,
+};
+let lastCredKeys = '';
+let wasWaiting = false;
+let waitingSince = 0;
+
+/* --------------------------------------------------------------------------
+ * File log: the host does not persist guest-service stdout anywhere
+ * retrievable (its main.log carries no service output), and an idle service
+ * is stopped, wiping memory. So diagnostics also go to a small rotating
+ * file with no secrets — the only post-hoc trace of restarts and waiting
+ * flashes. Writes are synchronous and rare (transitions only), so a kill
+ * cannot lose buffered lines.
+ * ------------------------------------------------------------------------ */
+
+const LOG_MAX_BYTES = 200 * 1024;
+const LOG_PATH = process.env.USAGE_PACE_LOG_PATH
+  || path.join(os.tmpdir(), 'openchamber-usage-pace.log');
+let fileLogEnabled = false;
+
+function serviceLog(message) {
+  console.log(`usage-pace: ${message}`);
+  if (!fileLogEnabled) return;
+  try {
+    try {
+      if (fs.existsSync(LOG_PATH) && fs.statSync(LOG_PATH).size > LOG_MAX_BYTES) {
+        try { fs.rmSync(`${LOG_PATH}.1`, { force: true }); } catch { /* ignore */ }
+        fs.renameSync(LOG_PATH, `${LOG_PATH}.1`);
+      }
+    } catch { /* fall through to append */ }
+    fs.appendFileSync(LOG_PATH, `[${new Date().toISOString()}] [pid=${process.pid}] ${message}\n`);
+  } catch { /* logging must never break the service */ }
+}
+
 /**
  * The latest credential map the host handed over (`input.credentials` of
  * `usage.read`), kept for the host-driven `/status` polls between card
@@ -446,12 +524,41 @@ function storeCredentials(input) {
     && input.credentials && typeof input.credentials === 'object'
     && Object.keys(input.credentials).length > 0) {
     lastCredentials = input.credentials;
+    // Provider ids only, never credential values.
+    const keys = Object.keys(input.credentials).sort().join(',');
+    if (keys !== lastCredKeys) {
+      lastCredKeys = keys;
+      serviceLog(`credentials shared for [${keys}]`);
+    }
   }
+}
+
+/**
+ * Resolve once shared credentials appear, or when the timeout elapses.
+ * Only the polling GET /status path waits (force=false); the POST /quota
+ * path just stored credentials and never needs it.
+ */
+function waitForCredentials(timeoutMs) {
+  if (lastCredentials) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const start = Date.now();
+    const timer = setInterval(() => {
+      if (lastCredentials || Date.now() - start >= timeoutMs) {
+        clearInterval(timer);
+        resolve(Boolean(lastCredentials));
+      }
+    }, CREDENTIAL_WAIT_STEP_MS);
+  });
 }
 
 async function getQuota(force = false) {
   if (!force && quotaCache.result && Date.now() - quotaCache.at < CACHE_MS) {
     return { quota: quotaCache.result, stale: false, error: null, waiting: false };
+  }
+
+  if (!lastCredentials && !force) {
+    const found = await waitForCredentials(CREDENTIAL_WAIT_MS);
+    if (found) serviceLog('picked up shared credentials while waiting');
   }
 
   if (!lastCredentials) {
@@ -463,9 +570,18 @@ async function getQuota(force = false) {
 
   try {
     const result = await fetchGoQuota(lastCredentials);
+    stats.lastFetchAt = Date.now();
     if (result.ok) {
       quotaCache = { at: Date.now(), result };
+      stats.fetchOk += 1;
+      stats.lastFetchOkAt = Date.now();
+      stats.lastFetchError = null;
       return { quota: result, stale: false, error: null, waiting: false };
+    }
+    stats.fetchFail += 1;
+    if (stats.lastFetchError !== result.error) {
+      stats.lastFetchError = result.error;
+      serviceLog(`quota fetch failed: ${result.error}`);
     }
     if (quotaCache.result) {
       return { quota: quotaCache.result, stale: true, error: result.error, waiting: false };
@@ -473,6 +589,12 @@ async function getQuota(force = false) {
     return { quota: result, stale: false, error: result.error, waiting: false };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    stats.lastFetchAt = Date.now();
+    stats.fetchFail += 1;
+    if (stats.lastFetchError !== message) {
+      stats.lastFetchError = message;
+      serviceLog(`quota fetch failed: ${message}`);
+    }
     if (quotaCache.result) {
       return { quota: quotaCache.result, stale: true, error: message, waiting: false };
     }
@@ -608,6 +730,7 @@ function startServer() {
     console.error('OPENCHAMBER_SERVICE_PORT and OPENCHAMBER_SERVICE_TOKEN are required');
     process.exit(1);
   }
+  fileLogEnabled = true;
 
   const server = http.createServer(async (req, res) => {
     if (req.headers.authorization !== `Bearer ${token}`) {
@@ -618,15 +741,29 @@ function startServer() {
     const url = new URL(req.url || '/', 'http://127.0.0.1');
 
     if (req.method === 'GET' && url.pathname === '/health') {
-      sendJson(res, 200, { ok: true });
+      sendJson(res, 200, { ok: true, stats });
       return;
     }
 
     if (req.method === 'GET' && url.pathname === '/status') {
       const locale = url.searchParams.get('locale') || 'en';
       const { quota, stale, error, waiting } = await getQuota(false);
+      stats.statusGets += 1;
+      if (waiting) {
+        stats.statusWaiting += 1;
+        if (!wasWaiting) {
+          waitingSince = Date.now();
+          const sinceQuota = stats.lastQuotaAt
+            ? `, last POST /quota ${Math.round((Date.now() - stats.lastQuotaAt) / 1000)}s ago`
+            : ', no POST /quota since start';
+          serviceLog(`/status waiting for shared credentials${sinceQuota}`);
+        }
+      } else if (wasWaiting) {
+        serviceLog(`/status recovered after ${Math.round((Date.now() - waitingSince) / 1000)}s of waiting`);
+      }
+      wasWaiting = waiting;
       const strings = stringsFor(locale);
-      sendJson(res, 200, buildView({ quota, locale, stale, error: waiting ? strings.waiting : error }));
+      sendJson(res, 200, buildView({ quota, locale, stale, error: waiting ? strings.waiting : error, waiting }));
       return;
     }
 
@@ -652,6 +789,13 @@ function startServer() {
           return;
         }
         storeCredentials(parsed.input);
+        stats.quotaPosts += 1;
+        if (parsed.input && parsed.input.credentials
+          && typeof parsed.input.credentials === 'object'
+          && Object.keys(parsed.input.credentials).length > 0) {
+          stats.quotaWithCreds += 1;
+          stats.lastQuotaAt = Date.now();
+        }
         try {
           const { quota, waiting } = await getQuota(true);
           const data = mapQuotaToUsageData(quota);
@@ -673,12 +817,14 @@ function startServer() {
   });
 
   server.on('error', (error) => {
+    serviceLog(`service error: ${error.message}`);
     console.error('usage-pace service error:', error.message);
     process.exit(1);
   });
 
   server.listen(port, '127.0.0.1', () => {
-    console.log(`usage-pace service listening on 127.0.0.1:${port}`);
+    serviceLog(`service started listening on 127.0.0.1:${port}`);
+    console.log(`usage-pace service started (pid=${process.pid}) listening on 127.0.0.1:${port}`);
   });
 }
 
@@ -691,8 +837,10 @@ module.exports = {
   valueUnits,
   stringsFor,
   getQuota,
+  waitForCredentials,
   storeCredentials,
   mapQuotaWindow,
   mapQuotaToUsageData,
   parseUsageRead,
+  stats,
 };

@@ -560,6 +560,37 @@ test('monthly tooltip copy', () => {
   assert.match(monthly.tooltip, /98% left/);
 });
 
+test('waiting for shared credentials shows a muted note, not an error', () => {
+  const ru = buildView({ quota: null, locale: 'ru', error: 'CREDENTIAL_NOT_SHARED', waiting: true, now: Date.now() });
+  assert.equal(ru.rows.length, 1);
+  assert.equal(ru.rows[0].kind, 'note');
+  assert.equal(ru.rows[0].id, 'waiting');
+  assert.equal(ru.rows[0].tone, 'muted');
+  assert.match(ru.rows[0].text, /Usage/);
+
+  const en = buildView({ quota: null, locale: 'en', error: 'CREDENTIAL_NOT_SHARED', waiting: true, now: Date.now() });
+  assert.equal(en.rows[0].id, 'waiting');
+  assert.equal(en.rows[0].tone, 'muted');
+  assert.match(en.rows[0].text, /Usage/);
+});
+
+test('a real fetch error still shows a red note without a double period', () => {
+  const view = buildView({ quota: null, locale: 'ru', error: 'timeout.', now: Date.now() });
+  assert.equal(view.rows.length, 1);
+  assert.equal(view.rows[0].id, 'error');
+  assert.equal(view.rows[0].tone, 'error');
+  assert.ok(!view.rows[0].text.endsWith('..'));
+  assert.match(view.rows[0].text, /Не удалось получить данные OpenCode Go: timeout\./);
+});
+
+test('stale data while waiting for credentials shows a muted hint', () => {
+  const { now, quota } = quotaFixture();
+  const view = buildView({ quota, now, stale: true, error: 'CREDENTIAL_NOT_SHARED', waiting: true });
+  assert.equal(view.rows.at(-1).id, 'stale-waiting');
+  assert.equal(view.rows.at(-1).tone, 'muted');
+  assert.match(view.rows.at(-1).text, /Usage/);
+});
+
 const failed = checks.filter((check) => !check.ok);
 console.log(`\n${checks.length - failed.length}/${checks.length} checks passed`);
 if (failed.length > 0) {
